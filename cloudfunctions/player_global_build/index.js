@@ -107,6 +107,12 @@ function buildGameUserKey(gameId, userId) {
   return String(gameId || '').trim() + '::' + String(userId || '').trim()
 }
 
+function buildGameIdentityKey(gameId, identity) {
+  if (!identity || !gameId) return ''
+  if (identity.isBound) return 'bound::' + buildGameUserKey(gameId, identity.userId)
+  return 'solo::' + buildBindingKey(gameId, identity.playerId)
+}
+
 function pushUnique(arr, value) {
   const v = String(value || '').trim()
   if (!v) return
@@ -527,6 +533,39 @@ function applyBindingOverride(row, bindingPairMap) {
   })
 }
 
+function getRowFreshnessTs(row) {
+  const tsList = [
+    toTs(row && row.analysisUpdateTime),
+    toTs(row && row.updateTime),
+    toTs(row && row.createTime)
+  ]
+  return Math.max.apply(null, tsList)
+}
+
+function getRowCompletenessScore(row) {
+  const rawRes = resolveRawCounts(row || {})
+  let score = 0
+  if (rawRes.hasRaw) score += 1000
+  score += Math.min(300, safeNumber(rawRes.counts.hands))
+  score += Math.min(200, Math.abs(safeNumber(row && row.net)))
+  if (String((row && row.userId) || '').trim()) score += 10
+  if (Array.isArray(row && row.boundNames) && row.boundNames.length > 0) score += 5
+  if (Array.isArray(row && row.styleTags) && row.styleTags.length > 0) score += 5
+  return score
+}
+
+function shouldPreferCandidateRow(currentRow, candidateRow) {
+  const currentTs = getRowFreshnessTs(currentRow)
+  const candidateTs = getRowFreshnessTs(candidateRow)
+  if (candidateTs !== currentTs) return candidateTs > currentTs
+
+  const currentScore = getRowCompletenessScore(currentRow)
+  const candidateScore = getRowCompletenessScore(candidateRow)
+  if (candidateScore !== currentScore) return candidateScore > currentScore
+
+  return String((candidateRow && candidateRow._id) || '') > String((currentRow && currentRow._id) || '')
+}
+
 async function loadGlobalDocIds() {
   const ids = []
   const MAX_LIMIT = 100
@@ -683,6 +722,7 @@ exports.main = async (event, context) => {
       return one.status === '已结束'
     }).length
 
+    const dedupedRowMap = {}
     const aggMap = {}
     const MAX_LIMIT = 100
     const countRes = await db.collection(PLAYER_STATS_COLLECTION).count()
@@ -697,16 +737,21 @@ exports.main = async (event, context) => {
       zeroHandsRows: 0,
       zeroHandsWithNetRows: 0,
       rawButAdvancedDenominatorZeroRows: 0,
+      duplicateRows: 0,
+      duplicateRowsReplaced: 0,
+      orphanEndedRows: 0,
       samples: []
     }
 
     while (offset < totalStatsRows) {
       const batch = await db.collection(PLAYER_STATS_COLLECTION)
         .field({
+          _id: true,
           gameId: true,
           playerId: true,
           userId: true,
           playerName: true,
+          createTime: true,
           isUser: true,
           avatarUrl: true,
           boundNames: true,
@@ -730,8 +775,10 @@ exports.main = async (event, context) => {
           styleTags: true,
           rawCounts: true,
           matchStatus: true,
+          analysisUpdateTime: true,
           updateTime: true
         })
+        .orderBy('_id', 'asc')
         .skip(offset)
         .limit(MAX_LIMIT)
         .get()
@@ -742,93 +789,152 @@ exports.main = async (event, context) => {
 
       rows.forEach(row => {
         const effectiveRow = applyBindingOverride(row, bindingPairMap)
-        const gameId = String(row.gameId || '').trim()
+        const gameId = String(effectiveRow.gameId || '').trim()
         if (!gameId) return
         const matchMeta = endedMatchMap[gameId] || null
-        const isEnded = (matchMeta && matchMeta.status === '已结束') || effectiveRow.matchStatus === '已结束'
-        if (!isEnded) return
+        // 只以 matches 集合为权威来源：避免孤儿统计行（例如对局已删除/不存在）污染总榜。
+        const isEnded = !!(matchMeta && matchMeta.status === '已结束')
+        if (!isEnded) {
+          if (String(effectiveRow.matchStatus || '') === '已结束') {
+            diagnostics.orphanEndedRows += 1
+            pushSample(diagnostics.samples, {
+              type: 'orphanEndedRow',
+              gameId: gameId,
+              playerId: String(effectiveRow.playerId || ''),
+              playerName: String(effectiveRow.playerName || ''),
+              statDocId: String(row._id || '')
+            }, 20)
+          }
+          return
+        }
 
         const identity = resolveIdentity(effectiveRow)
         if (!identity.globalPlayerKey) return
 
-        if (!aggMap[identity.globalPlayerKey]) {
-          aggMap[identity.globalPlayerKey] = initAggregate(identity, effectiveRow)
+        const dedupeKey = buildGameIdentityKey(gameId, identity)
+        if (!dedupeKey) return
+        const prev = dedupedRowMap[dedupeKey]
+        if (!prev) {
+          dedupedRowMap[dedupeKey] = {
+            gameId: gameId,
+            matchMeta: matchMeta,
+            identity: identity,
+            row: effectiveRow,
+            statDocId: String(row._id || '')
+          }
+          return
         }
-        const agg = aggMap[identity.globalPlayerKey]
-        usedRows += 1
-        agg.rowCount += 1
 
-        const net = safeNumber(effectiveRow.net)
-        const hands = safeNumber(effectiveRow.hands)
-        agg.totalNet += net
-        agg.gameSet[gameId] = true
-        if (!agg.displayName || agg.displayName === '未知选手') {
-          agg.displayName = String(effectiveRow.playerName || effectiveRow.userId || effectiveRow.playerId || '未知选手')
-        }
-        if (!agg.avatarUrl && effectiveRow.avatarUrl) agg.avatarUrl = String(effectiveRow.avatarUrl)
-
-        addNames(agg, effectiveRow)
-        addStyleVotes(agg, effectiveRow)
-        addRecentMatch(agg, effectiveRow, matchMeta, gameUserAliasMap)
-
-        const rawRes = resolveRawCounts(effectiveRow)
-        if (rawRes.hasRaw) agg.rawReadyRows += 1
-        else {
-          diagnostics.noRawRows += 1
-          if (hands > 0) {
-            diagnostics.nonZeroHandsNoRawRows += 1
-            pushSample(diagnostics.samples, {
-              type: 'noRawWithHands',
-              gameId: gameId,
-              playerId: String(effectiveRow.playerId || ''),
-              playerName: String(effectiveRow.playerName || ''),
-              hands: hands
-            }, 20)
+        diagnostics.duplicateRows += 1
+        const shouldReplace = shouldPreferCandidateRow(prev.row, effectiveRow)
+        if (shouldReplace) {
+          diagnostics.duplicateRowsReplaced += 1
+          dedupedRowMap[dedupeKey] = {
+            gameId: gameId,
+            matchMeta: matchMeta,
+            identity: identity,
+            row: effectiveRow,
+            statDocId: String(row._id || '')
           }
         }
 
-        if (hands <= 0) {
-          diagnostics.zeroHandsRows += 1
-          if (Math.abs(net) > 0) {
-            diagnostics.zeroHandsWithNetRows += 1
-            pushSample(diagnostics.samples, {
-              type: 'zeroHandsButHasNet',
-              gameId: gameId,
-              playerId: String(effectiveRow.playerId || ''),
-              playerName: String(effectiveRow.playerName || ''),
-              net: net
-            }, 20)
-          }
-        }
-
-        if (rawRes.hasRaw) {
-          const denSum =
-            safeNumber(rawRes.counts.calls) +
-            safeNumber(rawRes.counts.bet3Opp) +
-            safeNumber(rawRes.counts.cbetOpp) +
-            safeNumber(rawRes.counts.sawFlopHands) +
-            safeNumber(rawRes.counts.showdowns)
-          if (safeNumber(rawRes.counts.hands) > 0 && denSum <= 0) {
-            diagnostics.rawButAdvancedDenominatorZeroRows += 1
-            pushSample(diagnostics.samples, {
-              type: 'rawNoAdvancedDenominator',
-              gameId: gameId,
-              playerId: String(effectiveRow.playerId || ''),
-              playerName: String(effectiveRow.playerName || ''),
-              hands: safeNumber(rawRes.counts.hands)
-            }, 20)
-          }
-        }
-
-        COUNT_KEYS.forEach(key => {
-          agg.counts[key] += safeNumber(rawRes.counts[key])
-        })
-        if (agg.counts.hands <= 0 && hands > 0) agg.counts.hands = hands
+        pushSample(diagnostics.samples, {
+          type: shouldReplace ? 'duplicateRowReplaced' : 'duplicateRowIgnored',
+          gameId: gameId,
+          playerId: String(effectiveRow.playerId || ''),
+          userId: String(effectiveRow.userId || ''),
+          keptStatDocId: shouldReplace ? String(row._id || '') : String(prev.statDocId || ''),
+          candidateStatDocId: String(row._id || '')
+        }, 20)
       })
 
       if (rows.length < MAX_LIMIT) break
       offset += rows.length
     }
+
+    Object.keys(dedupedRowMap).forEach(key => {
+      const one = dedupedRowMap[key]
+      if (!one || !one.identity) return
+      const identity = one.identity
+      const effectiveRow = one.row || {}
+      const matchMeta = one.matchMeta || null
+      const gameId = String(one.gameId || effectiveRow.gameId || '').trim()
+      if (!gameId) return
+
+      if (!aggMap[identity.globalPlayerKey]) {
+        aggMap[identity.globalPlayerKey] = initAggregate(identity, effectiveRow)
+      }
+      const agg = aggMap[identity.globalPlayerKey]
+      usedRows += 1
+      agg.rowCount += 1
+
+      const net = safeNumber(effectiveRow.net)
+      const hands = safeNumber(effectiveRow.hands)
+      agg.totalNet += net
+      agg.gameSet[gameId] = true
+      if (!agg.displayName || agg.displayName === '未知选手') {
+        agg.displayName = String(effectiveRow.playerName || effectiveRow.userId || effectiveRow.playerId || '未知选手')
+      }
+      if (!agg.avatarUrl && effectiveRow.avatarUrl) agg.avatarUrl = String(effectiveRow.avatarUrl)
+
+      addNames(agg, effectiveRow)
+      addStyleVotes(agg, effectiveRow)
+      addRecentMatch(agg, effectiveRow, matchMeta, gameUserAliasMap)
+
+      const rawRes = resolveRawCounts(effectiveRow)
+      if (rawRes.hasRaw) agg.rawReadyRows += 1
+      else {
+        diagnostics.noRawRows += 1
+        if (hands > 0) {
+          diagnostics.nonZeroHandsNoRawRows += 1
+          pushSample(diagnostics.samples, {
+            type: 'noRawWithHands',
+            gameId: gameId,
+            playerId: String(effectiveRow.playerId || ''),
+            playerName: String(effectiveRow.playerName || ''),
+            hands: hands
+          }, 20)
+        }
+      }
+
+      if (hands <= 0) {
+        diagnostics.zeroHandsRows += 1
+        if (Math.abs(net) > 0) {
+          diagnostics.zeroHandsWithNetRows += 1
+          pushSample(diagnostics.samples, {
+            type: 'zeroHandsButHasNet',
+            gameId: gameId,
+            playerId: String(effectiveRow.playerId || ''),
+            playerName: String(effectiveRow.playerName || ''),
+            net: net
+          }, 20)
+        }
+      }
+
+      if (rawRes.hasRaw) {
+        const denSum =
+          safeNumber(rawRes.counts.calls) +
+          safeNumber(rawRes.counts.bet3Opp) +
+          safeNumber(rawRes.counts.cbetOpp) +
+          safeNumber(rawRes.counts.sawFlopHands) +
+          safeNumber(rawRes.counts.showdowns)
+        if (safeNumber(rawRes.counts.hands) > 0 && denSum <= 0) {
+          diagnostics.rawButAdvancedDenominatorZeroRows += 1
+          pushSample(diagnostics.samples, {
+            type: 'rawNoAdvancedDenominator',
+            gameId: gameId,
+            playerId: String(effectiveRow.playerId || ''),
+            playerName: String(effectiveRow.playerName || ''),
+            hands: safeNumber(rawRes.counts.hands)
+          }, 20)
+        }
+      }
+
+      COUNT_KEYS.forEach(countKey => {
+        agg.counts[countKey] += safeNumber(rawRes.counts[countKey])
+      })
+      if (agg.counts.hands <= 0 && hands > 0) agg.counts.hands = hands
+    })
 
     const finalRecords = Object.keys(aggMap).map(key => finalizeAggregate(aggMap[key], userProfileMap))
     finalRecords.sort((a, b) => safeNumber(b.totalNet) - safeNumber(a.totalNet))
@@ -882,6 +988,9 @@ exports.main = async (event, context) => {
           zeroHandsRows: diagnostics.zeroHandsRows,
           zeroHandsWithNetRows: diagnostics.zeroHandsWithNetRows,
           rawButAdvancedDenominatorZeroRows: diagnostics.rawButAdvancedDenominatorZeroRows,
+          duplicateRows: diagnostics.duplicateRows,
+          duplicateRowsReplaced: diagnostics.duplicateRowsReplaced,
+          orphanEndedRows: diagnostics.orphanEndedRows,
           suspiciousGlobalPlayers: suspiciousGlobalPlayers.length
         },
         durationMs: Date.now() - startedAt
